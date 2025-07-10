@@ -4,12 +4,19 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
+import torch.multiprocessing as mp
+
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model
+from nanovllm.utils.loader import load_model, torch_dtype_to_np_dtype
+from nanovllm.utils.zlogger import logger
+
+import numpy as np
+from numba import cuda
+
 
 
 class ModelRunner:
@@ -30,6 +37,33 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        
+        
+        self.handles = {}
+        for name, param in self.model.named_parameters():
+            shape = tuple(param.shape)
+            dtype = torch_dtype_to_np_dtype(param.dtype)
+            itemsize = np.dtype(dtype).itemsize
+            itemsize = np.dtype(dtype).itemsize
+            strides = tuple(s * itemsize for s in param.stride())
+            arr = cuda.cudadrv.devicearray.DeviceNDArray(shape, strides, dtype, param.data.data_ptr())
+            ipc_handle = arr.get_ipc_handle()
+            self.handles[name] = pickle.dumps({
+                "handle": ipc_handle,
+                "shape": shape,
+                "dtype": str(dtype),
+            })
+        logger.info(f"len_dict: {len(self.handles)}")
+        
+        parent_conn, child_conn = mp.Pipe()
+        p = mp.Process(target=child_main, args=(self.handles, child_conn))
+        p.start()
+        ret = parent_conn.recv()
+        p.join()
+        
+        for name, buf in self.model.named_buffers():
+            logger.info(f"buffer: {name}")
+        
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -249,3 +283,27 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+
+def child_main(handles, conn):
+    import pickle
+    import torch
+    import torch.utils.dlpack
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from numba import cuda
+    import numpy as np
+
+    # 1. 加载模型结构（但参数后面 patch）
+    model_name = "/workspace/model/qwen308B"
+    
+    # 2. todo: 声明模型的结构，但是不进行参数加载
+    # for name in handles:
+    #     logger.info(f"name: {name}")
+    # conn.send("output: OK")
+    # conn.close()
+
+    # 3. todo: 利用传递的 cuda ipc 进行模型参数的填充
+
+    # 3. todo: 实现一次推理
+
+    # 4. todo: 释放资源
