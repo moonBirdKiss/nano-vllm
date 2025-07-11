@@ -29,6 +29,34 @@ def torch_dtype_to_np_dtype(torch_dtype):
     else:
         raise TypeError(f"Unsupported torch dtype: {torch_dtype}")
 
+
+def np_dtype_to_torch_dtype(np_dtype):
+    import torch
+    import numpy as np
+    # 转成 np.dtype 对象
+    dtype = np.dtype(np_dtype)
+    if dtype == np.float16:
+        return torch.float16
+    elif dtype == np.float32:
+        return torch.float32
+    elif dtype == np.float64:
+        return torch.float64
+    elif dtype == np.uint16:   # 用于占位 bfloat16
+        return torch.bfloat16
+    elif dtype == np.int8:
+        return torch.int8
+    elif dtype == np.int16:
+        return torch.int16
+    elif dtype == np.int32:
+        return torch.int32
+    elif dtype == np.int64:
+        return torch.int64
+    elif dtype == np.bool_:
+        return torch.bool
+    else:
+        raise TypeError(f"Unsupported numpy dtype: {np_dtype}")
+
+
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 

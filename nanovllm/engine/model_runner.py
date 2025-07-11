@@ -5,17 +5,21 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 import torch.multiprocessing as mp
+mp.set_start_method("spawn", force=True)
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model, torch_dtype_to_np_dtype
+from nanovllm.utils.loader import load_model, torch_dtype_to_np_dtype, np_dtype_to_torch_dtype
 from nanovllm.utils.zlogger import logger
 
 import numpy as np
 from numba import cuda
+import os 
+from transformers import AutoTokenizer
+
 
 
 
@@ -40,29 +44,24 @@ class ModelRunner:
         
         
         self.handles = {}
+        
         for name, param in self.model.named_parameters():
-            shape = tuple(param.shape)
-            dtype = torch_dtype_to_np_dtype(param.dtype)
-            itemsize = np.dtype(dtype).itemsize
-            itemsize = np.dtype(dtype).itemsize
-            strides = tuple(s * itemsize for s in param.stride())
-            arr = cuda.cudadrv.devicearray.DeviceNDArray(shape, strides, dtype, param.data.data_ptr())
+            arr = cuda.as_cuda_array(param.data)   # torch tensor -> numba DeviceNDArray
             ipc_handle = arr.get_ipc_handle()
-            self.handles[name] = pickle.dumps({
-                "handle": ipc_handle,
-                "shape": shape,
-                "dtype": str(dtype),
-            })
+            stride = tuple(s * param.data.element_size() for s in param.stride())
+            self.handles[name] = (pickle.dumps(ipc_handle), param.shape, str(param.dtype), stride )
+            # logger.info(f"name: {name}, ipc_handle: {ipc_handle}, shape:{param.shape}, dtype:{param.dtype}, tuple: {stride}")
+            
         logger.info(f"len_dict: {len(self.handles)}")
         
         parent_conn, child_conn = mp.Pipe()
-        p = mp.Process(target=child_main, args=(self.handles, child_conn))
+        p = mp.Process(target=child_main, args=(self.handles, child_conn, hf_config))
         p.start()
         ret = parent_conn.recv()
         p.join()
         
         for name, buf in self.model.named_buffers():
-            logger.info(f"buffer: {name}")
+            logger.info(f"buffer: {name}, {buf.shape}, {buf.device}")
         
         self.sampler = Sampler()
         self.warmup_model()
@@ -285,25 +284,84 @@ class ModelRunner:
         )
 
 
-def child_main(handles, conn):
+def child_main(handles, conn, hf_config):
     import pickle
     import torch
     import torch.utils.dlpack
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from numba import cuda
     import numpy as np
+    
+    dist.init_process_group(
+        backend="nccl",
+        init_method="tcp://localhost:12312",
+        world_size=1,
+        rank=0
+    )
 
     # 1. 加载模型结构（但参数后面 patch）
-    model_name = "/workspace/model/qwen308B"
+    model = Qwen3ForCausalLM(hf_config)
+    model = model.to('cuda')
+    logger.info("[sub-child]: 模型结构加载完成")
     
-    # 2. todo: 声明模型的结构，但是不进行参数加载
-    # for name in handles:
-    #     logger.info(f"name: {name}")
-    # conn.send("output: OK")
-    # conn.close()
+    logger.info(f"handles: {type(handles)}")
+    
+    for name, param in model.named_parameters():
+        if name not in handles:
+            logger.error(f"[子进程] 跳过参数: {name}")
+            continue
+    
+    for name, (ipc_bytes, shape, dtype_str, stride) in handles.items():
+        ipc_handle = pickle.loads(ipc_bytes)
+        # logger.info(f"name: {name}, ipc_handle: {ipc_handle}, shape:{shape}, dtype:{dtype_str}")
+        with ipc_handle as d_param:
+            # logger.info(f"name:{name}, d_param: {d_param.shape}, {vars(d_param)}")
+            torch_tensor = torch.as_tensor(d_param, device="cuda")
+            # torch_tensor = torch.utils.dlpack.from_dlpack(d_param.to_dlpack())
+            param = dict(model.named_parameters())[name]
+            param.data = torch_tensor    
+    logger.info(f"[child]: loaded completed")
+    for name, buf in model.named_buffers():
+        logger.info(f"[child] buffer: {name}, shape: {buf.shape}, device: {buf.device}")
 
-    # 3. todo: 利用传递的 cuda ipc 进行模型参数的填充
+    
+    # todo: 进行一次 推理
+    tokenizer_path = "/workspace/model/qwen308B"
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
 
-    # 3. todo: 实现一次推理
+    # 4. 构造输入并推理
+    prompt = "Hello, world!"
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
+    seq_len = input_ids.shape[1]
+    positions = torch.arange(seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0)
 
-    # 4. todo: 释放资源
+    # 尝试模型生成（forward 或 generate）
+
+    model.eval()
+    with torch.no_grad():
+        try:
+            outputs = model(input_ids=input_ids, positions=positions)
+            # outputs 通常是一个 dict 或 tensor, 取 logits
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs
+            # 取最后一个 token 的 logits
+            next_token_logits = logits[:, -1, :]
+            # argmax 得到 token_id
+            next_token_id = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            # 拼接到 input_ids
+            output_ids = torch.cat([input_ids, next_token_id], dim=-1)
+            # decode 成文本
+            out_text = tokenizer.decode(output_ids[0])
+            logger.info(f"[child]: output token_ids: {output_ids.cpu().tolist()}")
+            logger.info(f"[child]: output text: {out_text}")
+            conn.send({"output_ids": output_ids.cpu().tolist(), "output_text": out_text})
+        except Exception as e:
+            logger.info(f"[child]: Exception during inference: {e}")
+            conn.send({"error": str(e)})
+
+    
+    
+    if dist.is_initialized():
+        dist.destroy_process_group()
+            
+
+    
